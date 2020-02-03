@@ -1,0 +1,499 @@
+
+dir <- "D:/"
+
+dataset.conf <- list(name="ccvExample2Linear",type="regression",rep=100,simRhoRep=1000)
+dataset.conf$dataConf <- list(n=400, p=1000, 
+                              truebeta=c(1.01,-0.06,0.72,1.55,2.32,-0.36,3.75,-2.04,-0.13,0.61),
+                              truemodel=c(1,2,3,5,7,11,13,17,19,23),
+                              pseudoTrueModel=c(1,2,3,5,7,11,13,17,19,23),
+                              rho=0.5, mu=0, xsigma=1, noiseSigma=1)
+
+n <- dataset.conf$dataConf$n
+SISConf <- list(family="gaussian", 
+                nsis=100,
+                iter = TRUE)
+
+algorithm.conf <- list(name="linearModel", type="regression", 
+                       algorConf = list(no_intercept=FALSE))
+crossvalidation.conf <- list(names="mx2bcv_inc", cvConf=list(n=n,m=3))
+
+
+WorkerInit <-function(packages){
+  for(p in packages){
+    library(p, character.only=TRUE)
+  }
+  NULL
+}
+########
+########
+data.generator <- function(dataConf){
+  if(!is.null(dataConf$seed))
+    set.seed(dataConf$seed)
+  n <- dataConf$n
+  p <- dataConf$p
+  rho <- dataConf$rho
+  truemodel <- dataConf$truemodel
+  mu <- dataConf$mu
+  
+  beta <- rep(0,p)
+  beta[truemodel] <- dataConf$truebeta
+  
+  corr <- diag(1,p)
+  for(i in 1:p)
+    for(j in 1:p)
+      corr[i,j]<-rho^abs(i-j)
+  
+  x <- mvrnorm(n, rep(mu,p), dataConf$xsigma * corr)
+  y <- x %*% beta + rnorm(n,0,dataConf$noiseSigma)
+  return(data.frame(x=x,y=y))
+}
+
+data.prepackages <- c("MASS")
+dataname <- dataset.conf$name
+dataConf <- dataset.conf$dataConf
+n <- dataConf$n
+p <- dataConf$p
+rep <- dataset.conf$rep
+
+##########
+##########
+
+calculate.nsis <- function(varISIS, n, p) {
+  nsis = floor(n/log(n))
+  if (p < n) 
+    nsis = p
+  return(nsis)
+}
+
+mg <- function(index, x = x, y = y, ones = ones, family = family, condind = condind) {
+  margfit = coef(glm.fit(cbind(ones, x[, index], x[, condind]), y, family = gaussian()))[2]
+  return(margfit)
+}
+
+margcoef <- function(x, y, condind = NULL, family, null.model = FALSE, iterind) {
+  n = dim(x)[1]
+  p = dim(x)[2]
+  ones = rep(1, n)
+  candind = setdiff(1:p, condind)
+  if (iterind == 0) {
+    margcoef = abs(cor(x, y))
+  } else {
+    if (null.model == TRUE) {
+      if (is.null(condind) == TRUE) {
+        x = x[sample(1:n), ]
+      }
+      if (is.null(condind) == FALSE) {
+        x[, candind] = x[sample(1:n), candind]
+      }
+    }
+    margcoef = abs(sapply(candind, mg, x, y, ones, family, condind))
+  }
+  return(margcoef)
+}
+
+int.size.k <- function(l1, l2, k) {
+  iensure = intensure(k, l1 = l1, l2 = l2, k = k)
+  ix01 = l1[1:iensure]
+  ix02 = l2[1:iensure]
+  ix0 = sort(intersect(ix01, ix02))
+  return(ix0)
+}
+intensure <- function(i, l1, l2, k) {
+  for(j in i:length(l1)){
+    if (length(intersect(l1[1:j], l2[1:j])) >= k) 
+      return(j)
+  }
+  # if (length(intersect(l1[1:i], l2[1:i])) >= k) 
+  #    return(i) else return(intensure(i + 1, l1, l2, k))
+}
+
+obtain.ix0 <- function(x, y, s1, s2, family, nsis, iter, varISIS, iterind) {
+  if (iter == FALSE) {
+    margcoef = margcoef(x, y, family = family, null.model = FALSE, iterind = iterind)
+    rankcoef = sort(margcoef, decreasing = TRUE, index.return = TRUE)
+    ix0 = rankcoef$ix[1:nsis]
+  } else {
+    if (varISIS == "vanilla") {
+      margcoef = margcoef(x, y, family = family, null.model = FALSE, iterind = iterind)
+      rankcoef = sort(margcoef, decreasing = TRUE, index.return = TRUE)
+      ix0 = rankcoef$ix[1:floor((2/3) * nsis)]
+    } else {
+      
+      margcoef1 = margcoef(x[s1, ], y[s1], family = family, null.model = FALSE, iterind = iterind)
+      margcoef2 = margcoef(x[s2, ], y[s2], family = family, null.model = FALSE, iterind = iterind)
+      
+      rankcoef1 = sort(margcoef1, decreasing = TRUE, index.return = TRUE)
+      rankcoef2 = sort(margcoef2, decreasing = TRUE, index.return = TRUE)
+      if (varISIS == "aggr") {
+        ix01 = rankcoef1$ix[1:floor((2/3) * nsis)]
+        ix02 = rankcoef2$ix[1:floor((2/3) * nsis)]
+        ix0 = sort(intersect(ix01, ix02))
+        if (length(ix0) <= 1) 
+          ix0 = int.size.k(rankcoef1$ix, rankcoef2$ix, 2)
+      }
+      if (varISIS == "cons") {
+        iensure = intensure(floor((2/3) * nsis), l1 = rankcoef1$ix, l2 = rankcoef2$ix, k = floor((2/3) * nsis))
+        ix01 = rankcoef1$ix[1:iensure]
+        ix02 = rankcoef2$ix[1:iensure]
+        ix0 = sort(intersect(ix01, ix02))
+      }
+    }
+  }
+  return(ix0)
+}
+
+obtain.newix <- function(x, y, ix1, candind, s1, s2, family, pleft, varISIS, iterind) {
+  if (varISIS == "vanilla") {
+    margcoef = margcoef(x, y, ix1, family = family, null.model = FALSE, iterind = iterind)
+    rankcoef = sort(margcoef, decreasing = TRUE, index.return = TRUE)
+    if (pleft > 0) 
+      newix = candind[rankcoef$ix[1:pleft]] else newix = NULL
+  } else {
+    margcoef1 = margcoef(x[s1, ], y[s1], ix1, family = family, null.model = FALSE, iterind = iterind)
+    margcoef2 = margcoef(x[s2, ], y[s2], ix1, family = family, null.model = FALSE, iterind = iterind)
+    rankcoef1 = sort(margcoef1, decreasing = TRUE, index.return = TRUE)
+    rankcoef2 = sort(margcoef2, decreasing = TRUE, index.return = TRUE)
+    if (pleft > 0) {
+      if (varISIS == "aggr") {
+        newix1 = candind[rankcoef1$ix[1:pleft]]
+        newix2 = candind[rankcoef2$ix[1:pleft]]
+        newix = sort(intersect(newix1, newix2))
+      }
+      if (varISIS == "cons") {
+        iensure = intensure(pleft, l1 = rankcoef1$ix, l2 = rankcoef2$ix, k = pleft)
+        newix1 = candind[rankcoef1$ix[1:iensure]]
+        newix2 = candind[rankcoef2$ix[1:iensure]]
+        newix = sort(intersect(newix1, newix2))
+      }
+    } else newix = NULL
+  }
+  return(newix)
+}
+
+sisglm <- function(x, y, family, nsis, iter, iter.max, varISIS, seed, standardize, s1=NULL, s2=NULL, split.tries=0){
+  
+  storage.mode(x) = "numeric"
+  n = dim(x)[1]; p = dim(x)[2]
+  models = vector("list")
+  if(is.null(nsis)==TRUE) nsis = calculate.nsis(varISIS=varISIS, n=n, p=p)
+  if(is.null(s1)==TRUE){
+    set.seed(seed)
+    split.sample = sample(1:n); s1 = split.sample[1:ceiling(n/2)]; s2 = setdiff(split.sample,s1)
+  }
+  if(standardize == TRUE){ 
+    old.x = x
+    x = scale(x)
+  }
+  iterind = 0 
+  
+  if(iter == TRUE){
+    ix0 = sort(obtain.ix0(x=x, y=y, s1=s1, s2=s2, family=family, nsis=nsis, iter=iter, varISIS=varISIS, iterind=iterind))
+    repeat{
+      iterind = iterind + 1
+      cat("Iter ", iterind, ": ", ix0,"\n")
+      ix1 = ix0
+      #cat("Iter ", iterind, ": ix1:", ix1,"\n")
+      if(length(ix1) >= nsis || iterind >= iter.max){
+        ix0 = ix1
+        if(length(ix1) >= nsis)
+          cat("Maximum number of variables selected \n")
+        if(iterind >= iter.max)
+          cat("Maximum number of iterations reached \n")              
+        break
+      }
+      
+      models[[iterind]] = ix1; flag.models = 0
+      if(iterind > 1){
+        for(j in 1:(iterind-1)){
+          if(identical(models[[j]],ix1) == TRUE) flag.models = 1
+        }
+      }
+      if(flag.models==1){
+        ix0 = ix1
+        cat("Model already selected \n")
+        break   
+      }     
+      
+      candind = setdiff(1:p, ix1)
+      pleft = nsis - length(ix1)
+      newix = sort(obtain.newix(x=x, y=y, candind=candind, ix1=ix1, s1=s1, s2=s2, family=family, pleft=pleft, varISIS=varISIS, iterind=iterind))
+      cat("Iter ", iterind, ": newix:", newix,"\n")
+      ix1 = sort(c(ix1, newix))
+      if(setequal(ix1,ix0)){
+        ix0 = sort(setdiff(ix1,newix))
+        cat("Model already selected \n")
+        break
+      }
+      ix0 = ix1
+    }                        # end repeat
+    
+  }else{                      # end if(iter==TRUE)
+    ix0 = sort(obtain.ix0(x=x, y=y, s1=s1, s2=s2, family=family, nsis=nsis, iter=iter, varISIS=varISIS, iterind=iterind))
+  }    
+  
+  return(ix=ix0)
+}
+
+SIS <- function(x, y, family = "gaussian",  nsis = NULL, iter = TRUE, iter.max = 10, 
+                varISIS = c("vanilla","aggr","cons"), seed = 0, standardize = TRUE){
+  
+  family = match.arg(family)
+  
+  if(is.null(x)||is.null(y)) stop("The data is missing!")
+  
+  fit <- sisglm(x, y, "gaussian",  nsis, iter, iter.max, varISIS, seed, standardize)
+  
+  return(fit)
+}
+
+########
+########
+linearModel.fit<-function(data_train, algorConf){
+  omittingIntercept <- algorConf$no_intercept 
+  fom_str <- ""
+  if ( omittingIntercept ) {
+    fom_str <- paste(colnames(data_train)[ncol(data_train)], '~.-1', sep="")
+  } else {
+    fom_str <- paste(colnames(data_train)[ncol(data_train)], '~.', sep="")
+  }
+  formu <- as.formula(fom_str)
+  md <- lm(formu,data=data_train)
+  rm_vars <- names(which(is.na(md$coefficients)))
+  while (length(rm_vars) > 0) {
+    str <- ""
+    for(var in rm_vars) {
+      str <- paste(str, var, sep="-")
+    }
+    if ( omittingIntercept ) {
+      fom_str <- paste(colnames(data_train)[ncol(data_train)], '~.-1', str, sep="")
+    } else {
+      fom_str <- paste(colnames(data_train)[ncol(data_train)], '~.', str, sep="")
+    }
+    formu <- as.formula(fom_str)
+    md <- lm(formu,data=data_train)
+    rm_vars <- names(which(is.na(md$coefficients)))
+  }
+  return(md)
+}
+
+
+linearModel.predict<-function(fit, data_test, algorConf){  
+  omittingIntercept <- algorConf$no_intercept
+  pre <- predict.lm(fit, newdata=data_test)
+  return(c(pre))  
+}
+
+
+algor.generator <- function(data_train, data_test, algorConf) {
+  model <- lm.fit(data_train, algorConf)
+  pre <- lm.predict(model, data_test, algorConf)
+  return(pre)
+}
+algor.names <- algorithm.conf$name
+algorConf <- algorithm.conf$algorConf
+
+#######
+#######
+cvnames <- crossvalidation.conf$name
+cvConf <- crossvalidation.conf$cvConf
+
+mx2bcv_inc.Generator <- function(cvConf) {
+  f2 <- function(x,y){return(y[x])}
+  f3 <- function(x,y){return(y[[x]])}
+  n <- NULL
+  if (!is.null(cvConf$data)) { 
+    n <- nrow(cvConf$data)  
+  } else {
+    n <- cvConf$n
+  }
+  m <- cvConf$m  
+  if(m >= 2^floor(log(n,base=2))){
+    stop("m is out of range.");
+  }
+  m_prev <- cvConf$m_prev 
+  if(is.null(m_prev)) 
+    m_prev <- 0 
+  if(m_prev > 0) {
+    if( is.null(cvConf$orthArray) ){
+      stop("no orth array infor.")
+    }
+  }
+  if( is.null(cvConf$orthArray) ) {
+    cvConf$orthArray <- list()
+  }
+  if(is.null(cvConf$partitions)){
+    cvConf$partitions <- list()
+  }
+  cvConf$splits_new <- list()
+  for(temp_m in (m_prev+1):m){
+    
+    twoPowNum <- 2^floor(log(temp_m,base=2))
+    if(temp_m == twoPowNum) {
+      column <- rep(c(0,1), temp_m)
+      cvConf$orthArray[[temp_m]] <- column      
+    } else {
+      diff <- temp_m - twoPowNum
+      column1 <- cvConf$orthArray[[diff]]
+      column2 <- cvConf$orthArray[[twoPowNum]]
+      multiplier <- length(column2) / length(column1)
+      column <- as.numeric(xor(rep(column1, each=multiplier), column2))
+      cvConf$orthArray[[temp_m]] <- column     
+    }
+    #blocks
+    if(is.null(cvConf$blocks)) {
+      cvConf$blocks <- standardVFCV(n, 1,  2^(floor(log(temp_m,base=2))+1))
+    } else {
+      multiplier <- 2^(floor(log(temp_m,base=2))+1) / length(cvConf$blocks)
+      if(multiplier > 1) {
+        blocks <- list()
+        for(bindex in 1:length(cvConf$blocks)) {
+          blocks <- append(blocks, lapply(standardVFCV(length(cvConf$blocks[[bindex]]), 1, multiplier), f2, cvConf$blocks[[bindex]]))
+        }
+        cvConf$blocks <- blocks
+      }
+    }  
+    #splits
+    temp_split <- list()
+    temp_dual_split <- list()
+    nblocks <- 2^(floor(log(temp_m,base=2))+1)    
+    column <- cvConf$orthArray[[temp_m]]    
+    multiplier <- nblocks /length(column)
+    newColumn <- rep(column, each=multiplier)
+    
+    zeroIndice <- which(newColumn == 0)    
+    temp_split[[1]] <- unlist(lapply(zeroIndice, f3, cvConf$blocks))
+    temp_split[[2]] <- (1:n)[-temp_split[[1]]]
+    temp_dual_split[[1]] <- temp_split[[2]]
+    temp_dual_split[[2]] <- temp_split[[1]]
+    cvConf$partitions[[length(cvConf$partitions)+1]] <- temp_split
+    cvConf$partitions[[length(cvConf$partitions)+1]] <- temp_dual_split
+    cvConf$splits_new[[length(cvConf$splits_new)+1]] <- temp_split
+    cvConf$splits_new[[length(cvConf$splits_new)+1]] <- temp_dual_split
+  }
+  cvConf$m_prev <- m
+  return(cvConf)
+}
+
+
+mx2bcv_inc.Prepackages <- c()
+
+
+mx2bcv_inc.validation <- function(cvConf) {
+  if(is.null(cvConf$m)) {
+    return(FALSE)
+  }  
+  
+  return(TRUE)
+}
+
+
+
+standardVFCV <- function(n, n1, v, ...) {
+  ngroup <-v  
+  ngroup <- trunc(ngroup)
+  if( ngroup < 2){
+    stop ("folds < 2")
+  }
+  if(ngroup > n){
+    stop ("folds > n")
+  }
+  if(ngroup<=n){
+    o <- sample(1:n)
+    groups <- vector("list",ngroup)
+    for(j in 1:n){
+      jj <- (j-1) %% ngroup + 1
+      cnt <- trunc((j-1) / ngroup)
+      groups[[jj]][cnt + 1] <- o[j]
+    }
+  }
+  return(groups)  
+}
+
+
+##RCV
+
+RCVVarEst <- function(data, oneSplit, SISConf, algorConf, algor.generator){
+  nsis <- SISConf$nsis
+  part1 <- data[oneSplit[[1]],]
+  part2 <- data[oneSplit[[2]],]
+  
+  #sisix <- order(abs(cor(part1[,-ncol(part1)], part1[,ncol(part1)])),decreasing = T)[1:nsis]
+  sisix <- SIS(x=as.matrix(part1[,-ncol(part1)]), y=part1[,ncol(part1)],
+               family = SISConf$family, nsis = SISConf$nsis,
+               varISIS = "vanilla", iter = SISConf$iter)
+  
+  coef <- as.vector(algor.generator(part2[,c(sisix,ncol(part2))], algorConf)$coefficients)
+  errvec <- part2[,ncol(part2)] - as.matrix(cbind(rep(1,nrow(part2)),part2[,sisix])) %*% coef
+  varEst <- sum(errvec^2)/(nrow(part2)-nsis)
+  return(varEst)
+}
+
+#vote BCV
+RCVVoteVarEst <- function(data, splits, SISConf, algorConf, algor.generator){
+  nsis <- SISConf$nsis
+  #the vote model
+  sisixlist <- vector("list", length(splits))
+  for(i in 1:length(splits)){
+    part1 <- data[splits[[i]][[1]], ]
+    #sisixlist[[i]] <- order(abs(cor(part1[,-ncol(part1)], part1[,ncol(part1)])),decreasing = T)[1:nsis]
+    sisixlist[[i]] <- SIS(x=as.matrix(part1[,-ncol(part1)]), y=part1[,ncol(part1)],
+                 family = SISConf$family, nsis = SISConf$nsis,
+                 varISIS = "vanilla", iter = SISConf$iter)
+  }
+  sisix <- as.numeric(names(sort(table(unlist(sisixlist)), decreasing = TRUE)[1:nsis]))
+  
+  #variance estimation
+  varEst <- c()
+  length(varEst) <- length(splits)
+  for(i in 1:length(splits)){
+    part2 <- data[splits[[i]][[2]], ]
+    coef <- as.vector(algor.generator(part2[,c(sisix,ncol(part2))], algorConf)$coefficients)
+    errvec <- part2[,ncol(part2)] - as.matrix(cbind(rep(1,nrow(part2)),part2[,sisix])) %*% coef
+    varEst[i] <- sum(errvec^2)/(nrow(part2)-nsis)
+  }
+  return(varEst)
+}
+
+library(foreach)
+library(doParallel)
+cl <- makeCluster(4)
+#cl <- makeCluster(type="MPI")
+registerDoParallel(cl)
+
+param1v.length <- rep
+work.directory <- getwd()
+results <- foreach(idx = 1: param1v.length, .export = ls(.GlobalEnv)) %dopar%{
+  setwd(work.directory)
+  WorkerInit(c(data.prepackages, algor.prepackages))
+  
+  if(cvnames=="randommxkcv")
+    splits <- LoadCrossValidationGenerator(cvnames)[[1]](cvConf)
+  if(cvnames=="mx2bcv_inc")
+    splits <- LoadCrossValidationGenerator(cvnames)[[1]](cvConf)$partitions
+  
+  set.seed(idx)
+  data <- data.generator(dataConf = dataConf)
+  
+  varEst <- c()
+  length(varEst) <- length(splits)
+  if(cvnames=="randommxkcv"){
+    for(i in 1: length(splits)){
+      oneSplit <- splits[[i]]
+      varEst[i] <- RCVVarEst(data, oneSplit, SISConf, algorConf, algor.generator)
+    }
+  }
+  if(cvnames=="mx2bcv_inc")
+    varEst <- RCVVoteVarEst(data, splits, SISConf, algorConf, algor.generator)
+  
+  return(mean(varEst))
+}
+stopCluster(cl)
+
+if(!file.exists(paste(dir,"result/varianceEst/",sep="")))
+  dir.create(paste(dir,"result/varianceEst/",sep=""))
+if(!file.exists(paste(dir,"result/varianceEst/", dataset.conf$name,sep="")))
+  dir.create(paste(dir,"result/varianceEst/", dataset.conf$name,sep=""))
+dir <- paste(dir,"result/varianceEst/", dataset.conf$name,sep="")
+varEstVec <- unlist(results)
+filecvname <- paste(crossvalidation.conf$names,"_m_",cvConf$m,"_",length(dataset.conf$dataConf$truebeta),sep="")
+write.csv(varEstVec, file=paste(dir,"/",filecvname,".csv",sep=""))
